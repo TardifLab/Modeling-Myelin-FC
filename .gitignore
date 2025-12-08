@@ -1,2 +1,12 @@
+# editable mode py files
 *.egg-info
 python/*.egg-info/
+
+# annoying macOS Finder files
+.DS_Store
+**/.DS_Store
+
+# other potential macOS metadata
+.AppleDouble
+.LSOverride
+._*
