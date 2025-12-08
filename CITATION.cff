@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "If you use this repository, please cite it as below."
+title: "Modeling Myelin FC: Reproducible Code & Data"
+authors:
+  - family-names: Nelson
+    given-names: Mark C
+date-released: 2025-12-07
+license: GNU
+repository-code: https://github.com/TardifLab/Modeling-Myelin-FC
+preferred-citation:
+  type: article
+  authors:
+    - family-names: Nelson
+      given-names: Mark C
+  title: "The role of white matter myelin in structural–functional network coupling"
+  journal: "TBD"
+  year: 2026
