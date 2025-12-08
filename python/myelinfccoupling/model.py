@@ -1,172 +1,294 @@
-import pandas as pd, numpy as np
+# myelinfccoupling/model.py
+
+from typing import Dict, Optional
+
+import numpy as np
+import pandas as pd
 import statsmodels.formula.api as smf
-def _dominance_interaction(df: pd.DataFrame, with_interactions: bool):
+
+from .config import Config
+
+
+def _ols_r2(X: np.ndarray, y: np.ndarray) -> float:
     """
-    Dominance analysis mirroring user's MATLAB method.
-    Uses variables x1=caliber, x2=myelin, x3=length; interactions: x2*x1 and x2*x3 when enabled.
-    Returns dicts (dom_lo, domfrac_lo, dom_hi, domfrac_hi).
+    Compute R^2 for OLS y ~ X (with intercept) using linear algebra.
+
+    Assumes X, y are already finite and aligned.
     """
-    import itertools
-    from math import factorial
-    # Build X matrix and drop NA rows
-    cols = ['caliber','myelin','length','FC']
+    X = np.asarray(X, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    if X.ndim == 1:
+        X = X[:, None]
+
+    n = X.shape[0]
+    if n == 0:
+        return np.nan
+
+    # Design matrix with intercept
+    X_design = np.column_stack([np.ones(n), X])
+
+    # Solve least squares
+    beta, _, _, _ = np.linalg.lstsq(X_design, y, rcond=None)
+    y_hat = X_design @ beta
+
+    ss_res = float(np.sum((y - y_hat) ** 2))
+    ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+
+    if ss_tot == 0:
+        return np.nan
+
+    return 1.0 - ss_res / ss_tot
+
+
+def _dominance_interaction(
+    df: pd.DataFrame, cfg: Config, with_interactions: bool
+) -> Dict[str, tuple]:
+    """
+    Dominance analysis adapted to handle interactions (see dominance_interaction.m)
+
+    Uses:
+        x1 = caliber
+        x2 = myelin
+        x3 = length
+        interactions: x2*x1 (myelin:caliber) and x2*x3 (myelin:length)
+
+    Returns a dict:
+        { variable_name: (dominance_value, dominance_percentage) }
+
+    When with_interactions=False, only the 3 main effects are included.
+    When with_interactions=True, both main effects and interactions are included.
+    """
+    cols = [cfg.col_cal, cfg.col_myelin, cfg.col_len, cfg.col_FC]
     D = df[cols].dropna().copy()
-    X = D[['caliber','myelin','length']].rename(columns={'caliber':'x1','myelin':'x2','length':'x3'})
-    y = D['FC']
-
-    # Lower-order only dominance (tab_lo)
-    # R2_full_lo: y ~ 1 + x1 + x2 + x3
-    m = smf.ols('FC ~ 1 + x1 + x2 + x3', data=pd.concat([y, X], axis=1)).fit()
-    R2_full_lo = m.rsquared
-    # R2_indi_lo: each Xi alone
-    R2_indi_lo = {}
-    for k in ['x1','x2','x3']:
-        m = smf.ols(f'FC ~ 1 + {k}', data=pd.concat([y, X[[k]]], axis=1)).fit()
-        R2_indi_lo[k] = m.rsquared
-    # R2_rest_lo: model excluding Xi
-    R2_rest_lo = {}
-    for k in ['x1','x2','x3']:
-        others = [t for t in ['x1','x2','x3'] if t != k]
-        m = smf.ols(f"FC ~ 1 + {' + '.join(others)}", data=pd.concat([y, X], axis=1)).fit()
-        R2_rest_lo[k] = m.rsquared
-    R2_marg_lo = {k: R2_full_lo - R2_rest_lo[k] for k in ['x1','x2','x3']}
-    dom_lo = {k: (R2_marg_lo[k] + R2_indi_lo[k])/2 for k in ['x1','x2','x3']}
-    s = sum(dom_lo.values()) or float('nan')
-    domfrac_lo = {k: (dom_lo[k]/s if s==s else float('nan')) for k in dom_lo}
-
-    # High-order with interactions (tab_hi)
-    if with_interactions:
-        # full model: y ~ 1 + x1 + x2 + x3 + x2*x1 + x2*x3
-        data = pd.concat([y, X], axis=1)
-        m = smf.ols('FC ~ 1 + x1 + x2 + x3 + x2*x1 + x2*x3', data=data).fit()
-        R2_full_hi = m.rsquared
-
-        # Identify interaction terms list and their variables
-        inter_terms = [('x2:x1', ['x2','x1']), ('x2:x3', ['x2','x3'])]
-
-        # Individual contributions
-        R2_indi_hi = {}
-        # lower-order terms: same as lo
-        for k in ['x1','x2','x3']:
-            R2_indi_hi[k] = R2_indi_lo[k]
-        # interactions: difference between models with and without interaction among its terms
-        for name, vars_ in inter_terms:
-            df_sub = data[['FC'] + vars_]
-            m_lo = smf.ols(f"FC ~ 1 + {' + '.join(vars_)}", data=df_sub).fit()
-            m_hi = smf.ols(f"FC ~ 1 + {'*'.join(vars_)}", data=df_sub).fit()
-            R2_indi_hi[name] = m_hi.rsquared - m_lo.rsquared
-
-        # R2_rest_hi: remove Xi and all its interactions; for interaction term, remove only that term
-        R2_rest_hi = {}
-        # for lower-order predictors
-        for k in ['x1','x2','x3']:
-            # remaining terms: drop k and any inter containing k
-            keep_inters = [it for it,_ in inter_terms if k not in it.split(':')]
-            rhs_parts = [t for t in ['x1','x2','x3'] if t != k]
-            rhs = ' + '.join(rhs_parts)
-            if keep_inters:
-                rhs += ' + ' + ' + '.join([it.replace(':','*') for it in keep_inters])
-            m = smf.ols(f'FC ~ 1 + {rhs}', data=data).fit()
-            R2_rest_hi[k] = m.rsquared
-        # for interaction terms: remove just that interaction
-        for name, vars_ in inter_terms:
-            keep_inters = [it for it,_ in inter_terms if it != name]
-            rhs = 'x1 + x2 + x3'
-            if keep_inters:
-                rhs += ' + ' + ' + '.join([it.replace(':','*') for it in keep_inters])
-            m = smf.ols(f'FC ~ 1 + {rhs}', data=data).fit()
-            R2_rest_hi[name] = m.rsquared
-
-        R2_marg_hi = {k: R2_full_hi - R2_rest_hi[k] for k in list(R2_rest_hi.keys())}
-        dom_hi = {k: (R2_marg_hi[k] + R2_indi_hi[k])/2 for k in R2_marg_hi}
-        s = sum(dom_hi.values()) or float('nan')
-        domfrac_hi = {k: (dom_hi[k]/s if s==s else float('nan')) for k in dom_hi}
-    else:
-        dom_hi = dom_lo
-        domfrac_hi = domfrac_lo
-
-    return dom_lo, domfrac_lo, dom_hi, domfrac_hi
-
-def _dominance_lmg(df: pd.DataFrame, predictors, target='FC'):
-    """LMG/Shapley dominance analysis for small p.
-    Returns dict {name: (raw, frac)}
-    """
-    import itertools
-    # Drop rows with NaNs in any used column
-    cols = list(predictors) + [target]
-    D = df.dropna(subset=cols)
-    p = len(predictors)
-    if p == 0:
+    if D.empty:
         return {}
-    # Precompute R2 for all subsets
-    subsets = []
-    R2 = {}
-    for k in range(p+1):
-        for comb in itertools.combinations(range(p), k):
-            subsets.append(comb)
-            if k == 0:
-                R2[comb] = 0.0
-            else:
-                colsX = [predictors[i] for i in comb]
-                f = target + ' ~ 1 + ' + ' + '.join(colsX)
-                m = smf.ols(f, data=D).fit()
-                R2[comb] = m.rsquared
-    # Shapley values
-    import math
-    shap = np.zeros(p)
-    for j in range(p):
-        for comb in subsets:
-            if j not in comb:
-                withj = tuple(sorted(list(comb) + [j]))
-                s = len(comb)
-                w = math.factorial(s) * math.factorial(p - s - 1) / math.factorial(p)
-                shap[j] += w * (R2[withj] - R2[comb])
-    R2_full = R2[tuple(range(p))]
-    dom_raw = shap
-    dom_frac = dom_raw / dom_raw.sum() if dom_raw.sum() > 0 else np.full_like(dom_raw, np.nan)
-    return {predictors[i]: (float(dom_raw[i]), float(dom_frac[i])) for i in range(p)}
+
+    X_main = D[[cfg.col_cal, cfg.col_myelin, cfg.col_len]].to_numpy()
+    y = D[cfg.col_FC].to_numpy()
+    N = X_main.shape[1]
+    names_main = [cfg.col_cal, cfg.col_myelin, cfg.col_len]
+
+    # --- Lower-order terms only ---
+    R2_full_lo = _ols_r2(X_main, y)
+    R2_indi_lo = np.array([_ols_r2(X_main[:, i], y) for i in range(N)])
+    R2_rest_lo = np.array(
+        [_ols_r2(np.delete(X_main, i, axis=1), y) for i in range(N)]
+    )
+    R2_marg_lo = R2_full_lo - R2_rest_lo
+    dom_lo = (R2_marg_lo + R2_indi_lo) / 2.0
+
+    if np.isfinite(dom_lo).all() and dom_lo.sum() != 0:
+        dom_lo_frac = dom_lo / dom_lo.sum() * 100.0
+    else:
+        dom_lo_frac = np.full_like(dom_lo, np.nan, dtype=float)
+
+    result_lo = {
+        names_main[i]: (float(dom_lo[i]), float(dom_lo_frac[i]))
+        for i in range(N)
+    }
+
+    if not with_interactions:
+        return result_lo
+
+    # --- Including interactions: myelin:caliber and myelin:length ---
+    # x1 = cal, x2 = myelin, x3 = length
+    x1, x2, x3 = X_main.T
+    inter_defs = [
+        (f"{cfg.col_myelin}:{cfg.col_cal}", (1, 0)),  # myelin:caliber (x2*x1)
+        (f"{cfg.col_myelin}:{cfg.col_len}", (1, 2)),  # myelin:length  (x2*x3)
+    ]
+    inter_cols = [x2 * x1, x2 * x3]
+
+    Xt_full = np.column_stack([X_main] + inter_cols)
+    N_tot = Xt_full.shape[1]
+
+    R2_full_hi = _ols_r2(Xt_full, y)
+
+    # Individual R2 (hi): copy lower-order for first N, then interaction increments
+    R2_indi_hi = np.zeros(N_tot)
+    R2_indi_hi[:N] = R2_indi_lo
+
+    for j, (_, (idx_my, idx_other)) in enumerate(inter_defs, start=N):
+        # Model with only main effects involved in this interaction
+        S = [idx_my, idx_other]
+        X_lo = X_main[:, S]
+        R2_lo = _ols_r2(X_lo, y)
+
+        # Model with main effects + interaction term
+        X_hi = np.column_stack([X_lo, Xt_full[:, j]])
+        R2_hi = _ols_r2(X_hi, y)
+
+        R2_indi_hi[j] = R2_hi - R2_lo
+
+    # Marginal R2 for hi model: drop each term (and associated interactions for mains)
+    R2_rest_hi = np.zeros(N_tot)
+    all_idx = list(range(N_tot))
+
+    # Which interaction columns involve each main effect:
+    # main index -> list of interaction indices
+    inter_map = {
+        0: [N],       # caliber in myelin:caliber
+        1: [N, N + 1],# myelin in both interactions
+        2: [N + 1],   # length in myelin:length
+    }
+
+    # Main effects: drop main + its interactions
+    for i in range(N):
+        drop = [i] + inter_map.get(i, [])
+        keep = [k for k in all_idx if k not in drop]
+        if keep:
+            X_rest = Xt_full[:, keep]
+            R2_rest_hi[i] = _ols_r2(X_rest, y)
+        else:
+            # No predictors left
+            R2_rest_hi[i] = 0.0
+
+    # Interactions: drop only the interaction term
+    for j in range(N, N_tot):
+        keep = [k for k in all_idx if k != j]
+        X_rest = Xt_full[:, keep]
+        R2_rest_hi[j] = _ols_r2(X_rest, y)
+
+    R2_marg_hi = R2_full_hi - R2_rest_hi
+    dom_hi = (R2_marg_hi + R2_indi_hi) / 2.0
+
+    if dom_hi.sum() != 0:
+        dom_hi_frac = dom_hi / dom_hi.sum() * 100.0
+    else:
+        dom_hi_frac = np.full_like(dom_hi, np.nan, dtype=float)
+
+    names_all = names_main + [name for name, _ in inter_defs]
+    result_hi = {
+        names_all[i]: (float(dom_hi[i]), float(dom_hi_frac[i]))
+        for i in range(N_tot)
+    }
+
+    return result_hi
 
 
-def _standardize(df, cols):
-    return (df[cols] - df[cols].mean())/df[cols].std(ddof=0)
+def _standardize(df: pd.DataFrame, cols) -> pd.DataFrame:
+    """Z-score columns in-place (ddof=0)."""
+    df = df.copy()
+    for c in cols:
+        if c in df.columns:
+            std = df[c].std(ddof=0)
+            if std != 0:
+                df[c] = (df[c] - df[c].mean()) / std
+    return df
 
-def _fit(df, with_interactions=True, standardize=True):
-    cols = dict(FC='FC', cal='caliber', my='myelin', ln='length')
-    if standardize:
-        df[['caliber','myelin','length']] = _standardize(df, ['caliber','myelin','length'])
+
+def _fit(df: pd.DataFrame, cfg: Config, with_interactions: bool) -> pd.Series:
+    """
+    Fit regression model for a single group of edges and return a Series
+    with R², coefficients, p-values, and dominance metrics.
+    """
+    cols = dict(FC=cfg.col_FC, cal=cfg.col_cal, my=cfg.col_myelin, ln=cfg.col_len)
+    work = df[[cols["FC"], cols["cal"], cols["my"], cols["ln"]]].copy()
+
+    # Standardize predictors and/or response
+    if cfg.standardize_predictors:
+        work = _standardize(work, [cols["cal"], cols["my"], cols["ln"]])
+    if cfg.standardize_response:
+        work = _standardize(work, [cols["FC"]])
+
+    # Formula with or without interactions
     if with_interactions:
-        formula = f"{cols['FC']} ~ 1 + {cols['my']}*{cols['cal']} + {cols['my']}*{cols['ln']}"
+        formula = (
+            f"{cols['FC']} ~ 1 + "
+            f"{cols['my']}*{cols['cal']} + {cols['my']}*{cols['ln']}"
+        )
     else:
-        formula = f"{cols['FC']} ~ 1 + {cols['cal']} + {cols['my']} + {cols['ln']}"
-    m = smf.ols(formula, data=df).fit()
-    dom_lo, domfrac_lo, dom_hi, domfrac_hi = _dominance_interaction(df, with_interactions=with_interactions)
-    dom = dom_hi if with_interactions else dom_lo
-    domfrac = domfrac_hi if with_interactions else domfrac_lo
-    out = {'N': len(df), 'R2': m.rsquared, 'R2adj': m.rsquared_adj, 'AIC': m.aic, 'BIC': m.bic}
-    for name, coef in m.params.items():
-        out[f"{name}_B"] = coef
-        out[f"{name}_p"] = m.pvalues.get(name, np.nan)
-    name_map = {'x1':'caliber','x2':'myelin','x3':'length','x2:x1':'int_my_cal','x2:x3':'int_my_len'}
-    for k,v in dom.items():
-        out[f"dom_{name_map.get(k,k)}"] = v
-    for k,v in domfrac.items():
-        out[f"domfrac_{name_map.get(k,k)}"] = v
-    return pd.Series(out)
+        formula = (
+            f"{cols['FC']} ~ 1 + "
+            f"{cols['cal']} + {cols['my']} + {cols['ln']}"
+        )
 
-def run(edges: pd.DataFrame, level: str, with_interactions=True):
+    # Fit OLS
+    model = smf.ols(formula, data=work).fit()
+
+    r: Dict[str, float] = {}
+    r["n_edges"] = int(df.shape[0])
+    r["n_obs"] = int(model.nobs)
+    r["R2"] = float(model.rsquared)
+    r["R2_adj"] = float(model.rsquared_adj)
+
+    # Coefficients and p-values
+    for name, val in model.params.items():
+        safe = name.replace(":", "_x_").replace(" ", "_")
+        r[f"B_{safe}"] = float(val)
+        r[f"p_{safe}"] = float(model.pvalues.get(name, np.nan))
+
+    # Dominance analysis
+    dom = _dominance_interaction(work, cfg, with_interactions=with_interactions)
+    for var, (dom_val, dom_frac) in dom.items():
+        safe = var.replace(":", "_x_")
+        r[f"dom_{safe}"] = dom_val
+        r[f"domfrac_{safe}"] = dom_frac
+
+    return pd.Series(r)
+
+
+def run(
+    edges: pd.DataFrame,
+    level: str,
+    with_interactions: bool = True,
+    cfg: Optional[Config] = None,
+) -> pd.DataFrame:
+    """
+    Run regression + dominance for a given level:
+
+    level in {'global', 'rsn_pairs', 'nodewise'}.
+
+    Returns a DataFrame with one row per group at that level:
+    - global:   single row
+    - rsn_pairs: one row per RSN pair (unordered)
+    - nodewise: one row per node (i/j pooled)
+    """
+    if cfg is None:
+        cfg = Config()
+
     rows = []
-    if level=='global':
-        rows.append(_fit(edges, with_interactions))
-    elif level=='rsn_pairs':
-        pair = pd.DataFrame({'p': np.where(edges['rsn_i']<edges['rsn_j'],
-                                           edges['rsn_i']+'–'+edges['rsn_j'],
-                                           edges['rsn_j']+'–'+edges['rsn_i'])})
-        edges2 = edges.join(pair)
-        for k, sub in edges2.groupby('p'):
-            s = _fit(sub, with_interactions); s['key'] = k; rows.append(s)
-    elif level=='nodewise':
-        for k, sub in pd.concat([edges.rename(columns={'i':'node'}), edges.rename(columns={'j':'node'})]).groupby('node'):
-            s = _fit(sub, with_interactions); s['key'] = k; rows.append(s)
+
+    if level == "global":
+        s = _fit(edges, cfg, with_interactions)
+        s["level"] = "global"
+        s["key"] = "global"
+        rows.append(s)
+
+    elif level == "rsn_pairs":
+        # Unordered RSN pair label (min–max)
+        rsn_i = edges[cfg.col_rsn_i].astype(str)
+        rsn_j = edges[cfg.col_rsn_j].astype(str)
+        p = np.where(
+            rsn_i < rsn_j,
+            rsn_i + "–" + rsn_j,
+            rsn_j + "–" + rsn_i,
+        )
+        edges2 = edges.copy()
+        edges2["pair"] = p
+
+        for key, sub in edges2.groupby("pair"):
+            s = _fit(sub, cfg, with_interactions)
+            s["level"] = "rsn_pairs"
+            s["key"] = key
+            rows.append(s)
+
+    elif level == "nodewise":
+        # Pool edges incident on each node (i or j)
+        edges_i = edges.rename(columns={cfg.col_i: "node"})
+        edges_j = edges.rename(columns={cfg.col_j: "node"})
+        both = pd.concat([edges_i, edges_j], ignore_index=True)
+
+        for key, sub in both.groupby("node"):
+            s = _fit(sub, cfg, with_interactions)
+            s["level"] = "nodewise"
+            s["key"] = key
+            rows.append(s)
     else:
-        raise ValueError("level must be 'global','rsn_pairs','nodewise'")
+        raise ValueError("level must be 'global', 'rsn_pairs', or 'nodewise'")
+
+    if not rows:
+        return pd.DataFrame()
+
     return pd.DataFrame(rows)
