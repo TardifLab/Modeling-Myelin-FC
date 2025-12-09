@@ -35,4 +35,4 @@ All results saved to `out/` as:
 
 ---
 
-2025 Mark C Nelson – MNI — GNU (GPL 3.0) License (code), see `LICENSE`.
+2025 Mark C Nelson – MNI — GPL-3.0 License (code), see `LICENSE`.
